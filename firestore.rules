@@ -1,0 +1,106 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isValidNewUser(data, uid) {
+      return data.uid == uid
+        && data.uid == request.auth.uid
+        && data.username is string
+        && data.displayName is string
+        && data.email is string
+        && data.partnerUid == null
+        && data.isOnline is bool;
+    }
+
+    function unchangedImmutableFields() {
+      return request.resource.data.uid == resource.data.uid
+        && request.resource.data.username == resource.data.username
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.createdAt == resource.data.createdAt;
+    }
+
+    // Lets user A (request.auth.uid) update user B's (uid) doc ONLY when:
+    // A has a pending partnerRequests doc from B, and the write touches
+    // nothing but partnerUid, setting it to A's own uid. This is what makes
+    // "accept partner request" work without a Cloud Function: both sides of
+    // the pairing are validated as two independent, narrowly-scoped writes.
+    function isAcceptingPartnerLink(uid) {
+      return isSignedIn()
+        && get(/databases/$(database)/documents/partnerRequests/$(request.auth.uid)).data.fromUid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['partnerUid'])
+        && request.resource.data.partnerUid == request.auth.uid;
+    }
+
+    // Lets either side of an existing pairing null out partnerUid on the
+    // OTHER user's doc when unlinking.
+    function isUnlinkingPartner(uid) {
+      return isSignedIn()
+        && resource.data.partnerUid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['partnerUid'])
+        && request.resource.data.partnerUid == null;
+    }
+
+    // users/{uid}
+    match /users/{uid} {
+      allow read: if isSignedIn();
+      allow create: if isOwner(uid) && isValidNewUser(request.resource.data, uid);
+      allow update: if (isOwner(uid) && unchangedImmutableFields())
+        || isAcceptingPartnerLink(uid)
+        || isUnlinkingPartner(uid);
+      allow delete: if false;
+    }
+
+    // usernames/{username} — reservation table guaranteeing uniqueness.
+    match /usernames/{username} {
+      allow read: if true;
+      allow create: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid
+        && username == username.lower()
+        && username.size() >= 3
+        && username.size() <= 20;
+      allow update, delete: if false;
+    }
+
+    // partnerRequests/{uid} — one pending request per RECIPIENT uid.
+    match /partnerRequests/{uid} {
+      allow read: if isOwner(uid);
+      allow create: if isSignedIn()
+        && request.resource.data.fromUid == request.auth.uid
+        && request.auth.uid != uid
+        && !exists(/databases/$(database)/documents/partnerRequests/$(uid));
+      // Recipient can decline, sender can cancel their own pending request.
+      allow delete: if isSignedIn() && (isOwner(uid) || resource.data.fromUid == request.auth.uid);
+      allow update: if false;
+    }
+
+    // chats/{chatId} — chatId is the two participant uids, sorted and
+    // joined with "_". Only the two participants can ever read/write.
+    match /chats/{chatId} {
+      allow read: if isSignedIn() && request.auth.uid in resource.data.participants;
+      allow create: if isSignedIn()
+        && request.auth.uid in request.resource.data.participants
+        && request.resource.data.participants.size() == 2;
+      allow update: if isSignedIn()
+        && request.auth.uid in resource.data.participants
+        && request.resource.data.participants == resource.data.participants;
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow read: if isSignedIn()
+          && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+        allow create: if isSignedIn()
+          && request.resource.data.senderId == request.auth.uid
+          && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+        allow update, delete: if false;
+      }
+    }
+  }
+}
